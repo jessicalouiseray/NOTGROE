@@ -1,0 +1,125 @@
+# The workflow for Qiime2 (including my hacks):
+
+# Create a fictitious sample metadata file
+# Assuming you have organized the samples in separate folder with the folder name specifying the sample names, and within # each folder, there is a "Raw" folder containing the pairend forward and reverse files. NB! Files must be unzipped before they can be used in this workflow!
+
+===============================================================================
+ENSURE THERE ARE NO OTHER FILES IN THE SAMPLE FOLDER OTHER THAN THE DIRECTORIES
+OTHERWISE THEY WILL BE PICKED UP AND ASSIGNED A BARCODE AS WELL
+===============================================================================
+
+# Step 1: All you have to do is to run the following one liners to create the fictious barcodes and save them as sample_metadata.tsv file
+
+=============================================================================
+THIS HAS TO BE DONE IN A SEPARATE FOLDER, SAY /shared2/Jessica/NOTGROE_Qiime2
+=============================================================================
+
+d="/shared2/Jessica/NOTGROE_2019_18S/"; t=$(ls $d | wc -l);paste <(ls $d) <(perl -le 'sub p{my $l=pop @_;unless(@_){return map [$_],@$l;}return map { my $ll=$_; map [@$ll,$_],@$l} p(@_);} @a=[A,C,G,T]; print join("", @$_) for p(@a,@a,@a,@a,@a,@a,@a,@a);' | awk -v k=$t 'NR<=k{print}') | awk 'BEGIN{print "sample-id\tbarcode-sequence\n#q2:types\tcategorical"}1' > sample_metadata.tsv
+
+# Step 2: Generate barcodes
+
+(for i in $(ls $d); do bc=$(awk -v k=$i '$1==k{print $2}' sample_metadata.tsv); bioawk -cfastx -v k=$bc '{print "@"$1" "$4"\n"k"\n+";for(i=0;i< length(k);i++){printf "#"};printf "\n"}' $d/$i/Raw/*_R1_001.fastq ; done) > barcodes.fastq
+
+# Step 3: Assemble forward files
+
+(for i in $(ls $d); do bioawk -cfastx '{print "@"$1" "$4"\n"$seq"\n+\n"$qual}' $d/$i/Raw/*_R1_001.fastq ; done) > forward.fastq
+
+# Step 4: Assemble reverse files
+
+(for i in $(ls $d); do bioawk -cfastx '{print "@"$1" "$4"\n"$seq"\n+\n"$qual}' $d/$i/Raw/*_R2_001.fastq ; done) > reverse.fastq
+
+# Step 5: Zip all the files and move them to
+
+gzip *.fastq
+mkdir emp-paired-end-sequences; mv *.gz emp-paired-end-sequences/.
+
+# Step 6: Enable Qiime2 on Orion cluster
+
+export PATH=/home/opt/miniconda2/bin:$PATH
+source activate qiime2-2019.7
+
+# See if qiime is working properly:
+
+qiime --help
+
+# Step 7: Import the data according to the recommendations given at https://docs.qiime2.org/2019.7/tutorials/importing/#importing-seqs
+
+qiime tools import \
+  --type EMPPairedEndSequences \
+  --input-path emp-paired-end-sequences \
+  --output-path emp-paired-end-sequences.qza
+
+# Step 8: Demultiplex
+
+qiime demux emp-paired --p-no-golay-error-correction --i-seqs emp-paired-end-sequences.qza --m-barcodes-file sample_metadata.tsv --m-barcodes-column barcode-sequence --o-per-sample-sequences demux.qza --o-error-correction-details demux-details.qza
+
+# and visualise:
+
+qiime demux summarize --i-data ./demux.qza  --o-visualization ./demux.qzv
+qiime tools export --input-path demux.qzv --output-path output
+
+# Now try Dada2
+
+qiime dada2 denoise-paired --i-demultiplexed-seqs demux.qza --p-trim-left-f 0 --p-trim-left-r 0 --p-trunc-len-f 240 --p-trunc-len-r 200 --p-n-threads 0 --o-table table.qza --o-representative-sequences rep-seqs.qza --o-denoising-stats denoising-stats.qza --verbose
+
+# Step 9: Create phylogenetic tree
+
+# Step 9b: unset any conflicts with MAFFT binaries (that exist in your profile)
+
+unset MAFFT_BINARIES
+
+qiime phylogeny align-to-tree-mafft-fasttree --i-sequences rep-seqs.qza --o-alignment aligned-rep-seqs.qza --o-masked-alignment masked-aligned-rep-seqs.qza --p-n-threads 0 --o-tree unrooted-tree.qza --o-rooted-tree rooted-tree.qza
+
+# Step 10: Assign taxonomy
+
+############## Silva
+qiime feature-classifier classify-sklearn --i-classifier /software/qiime2_databases/silva-132-99-nb-classifier.qza --i-reads rep-seqs.qza --o-classification taxonomy.qza
+
+qiime metadata tabulate --m-input-file taxonomy.qza --o-visualization taxonomy.qzv
+
+# Exporting Data (to use with R)
+
+qiime tools export --input-path table.qza --output-path output
+qiime tools export --input-path rep-seqs.qza --output-path output
+qiime tools export --input-path rooted-tree.qza --output-path output
+qiime tools export --input-path taxonomy.qza --output-path output
+
+Then go inside the output folder and convert the files to be compatible with R
+
+biom convert -i feature-table.biom -o feature-table.tsv --to-tsv
+
+sed -i s/Taxon/taxonomy/ taxonomy.tsv | sed -i s/Feature\ ID/FeatureID/ taxonomy.tsv
+
+biom add-metadata \
+  -i feature-table.tsv \
+  -o feature_w_tax.biom \
+  --observation-metadata-fp taxonomy.tsv \
+  --observation-header FeatureID,taxonomy,Confidence \
+  --sc-separated taxonomy --float-fields Confidence
+
+# In the output folder feature_w_tax.biom and tree.nwk are the things you require for analysis.
+
+############# PR2
+qiime feature-classifier classify-sklearn --i-classifier pr2_version_4.12.0_18S-classifier.qza --i-reads rep-seqs.qza --o-classification taxonomy-pr2.qza
+
+qiime metadata tabulate --m-input-file taxonomy-pr2.qza --o-visualization taxonomy-pr2.qzv
+
+qiime tools export --input-path table.qza --output-path output
+qiime tools export --input-path rep-seqs.qza --output-path output
+qiime tools export --input-path rooted-tree.qza --output-path output
+qiime tools export --input-path taxonomy-pr2.qza --output-path output
+
+Then go inside the output folder and convert the files to be compatible with R
+
+biom convert -i feature-table.biom -o feature-table.tsv --to-tsv
+
+sed -i s/Taxon/taxonomy/ taxonomy.tsv | sed -i s/Feature\ ID/FeatureID/ taxonomy.tsv
+
+biom add-metadata \
+  -i feature-table.tsv \
+  -o feature_w_tax.biom \
+  --observation-metadata-fp taxonomy.tsv \
+  --observation-header FeatureID,taxonomy,Confidence \
+  --sc-separated taxonomy --float-fields Confidence
+
+# In the output folder feature_w_tax.biom and tree.nwk are the things you require for analysis.
